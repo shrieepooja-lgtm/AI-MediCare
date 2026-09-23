@@ -1,7 +1,9 @@
-from flask import Flask, render_template, request, session, jsonify
+import os
+
+from flask import Flask, render_template, request, session, jsonify, redirect, url_for
 import pandas as pd
-from sentence_transformers import SentenceTransformer
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.svm import LinearSVC
 import PyPDF2
 import sqlite3
 from datetime import datetime
@@ -9,20 +11,22 @@ from flask_mail import Mail, Message
 import random
 
 app = Flask(__name__)
-app.secret_key = 'super_secret_ai_medicare_key' 
+app.secret_key = os.environ.get('SECRET_KEY', 'local-development-only')
+DEMO_MODE = os.environ.get('DEMO_MODE', 'false').lower() == 'true'
+DATABASE_PATH = os.environ.get('DATABASE_PATH', 'patients.db')
 
 # ================= MAIL SETUP =================
 app.config['MAIL_SERVER'] = 'smtp.gmail.com'
 app.config['MAIL_PORT'] = 587
 app.config['MAIL_USE_TLS'] = True
-app.config['MAIL_USERNAME'] = 'shrieepooja@gmail.com'   
-app.config['MAIL_PASSWORD'] = 'qohsmvgpplzcipij' 
+app.config['MAIL_USERNAME'] = os.environ.get('MAIL_USERNAME')
+app.config['MAIL_PASSWORD'] = os.environ.get('MAIL_PASSWORD')
 mail = Mail(app)
 # ==============================================
 
 # --- DATABASE SETUP ---
 def init_db():
-    conn = sqlite3.connect('patients.db')
+    conn = sqlite3.connect(DATABASE_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS patient_history
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, age TEXT, record_type TEXT, disease TEXT, recommendation TEXT, date TEXT)''')
@@ -32,7 +36,7 @@ def init_db():
 init_db()
 
 def save_to_db(name, age, record_type, disease, recommendation):
-    conn = sqlite3.connect('patients.db')
+    conn = sqlite3.connect(DATABASE_PATH)
     c = conn.cursor()
     date_str = datetime.now().strftime("%d-%b-%Y %I:%M %p")
     c.execute("INSERT INTO patient_history (name, age, record_type, disease, recommendation, date) VALUES (?, ?, ?, ?, ?, ?)",
@@ -40,7 +44,7 @@ def save_to_db(name, age, record_type, disease, recommendation):
     conn.commit()
     conn.close()
 
-print("Loading AI Model (BERT)...")
+print("Loading symptom classification model...")
 df = pd.read_csv('Symptom2Disease.csv')
 if 'Unnamed: 0' in df.columns:
     df = df.drop(columns=['Unnamed: 0'])
@@ -48,13 +52,13 @@ if 'Unnamed: 0' in df.columns:
 new_data = pd.DataFrame({'label': ['Chronic Pain']*5, 'text': ["I have body pain for past 6 months.", "Experiencing severe body pain for the last 6 months.", "My body has been hurting continuously for 6 months.", "I have body pain for 6 months straight.", "For 6 months I am suffering from body pain."]})
 df = pd.concat([df, new_data], ignore_index=True)
 
-encoder = SentenceTransformer('all-MiniLM-L6-v2')
-X = encoder.encode(df['text'].tolist())
+encoder = TfidfVectorizer(ngram_range=(1, 2), max_features=12000, sublinear_tf=True)
+X = encoder.fit_transform(df['text'].astype(str))
 y = df['label']
 
-model = RandomForestClassifier(n_estimators=100, random_state=42)
+model = LinearSVC(random_state=42)
 model.fit(X, y)
-print("Model Ready! 🚀")
+print("Model ready")
 
 recommendations = {
     "drug reaction": {"test": "Allergy Blood Test", "doctor": "Allergist"},
@@ -73,6 +77,9 @@ recommendations = {
 def send_otp():
     data = request.get_json()
     email = data.get('email')
+
+    if not app.config['MAIL_USERNAME'] or not app.config['MAIL_PASSWORD']:
+        return jsonify({'success': False, 'message': 'Email login is not configured.'}), 503
     
     otp = str(random.randint(1000, 9999))
     session['otp'] = otp 
@@ -95,6 +102,8 @@ def verify_otp():
 
 @app.route('/')
 def login():
+    if DEMO_MODE:
+        return redirect(url_for('dashboard'))
     return render_template('login.html')
 
 @app.route('/dashboard')
@@ -106,7 +115,7 @@ def symptoms():
     result = None
     if request.method == 'POST':
         name, age, symp = request.form['name'], request.form['age'], request.form['symptoms']
-        symptom_vec = encoder.encode([symp])
+        symptom_vec = encoder.transform([symp])
         pred = model.predict(symptom_vec)[0]
         rec = recommendations.get(pred, recommendations["default"])
         save_to_db(name, age, "Symptoms", pred, f"{rec['test']} | {rec['doctor']}")
@@ -126,7 +135,7 @@ def report():
                     ext = p.extract_text()
                     if ext: text += ext + " "
             if not text.strip(): text = "Severe body pain and weakness."
-            pred = model.predict(encoder.encode([text]))[0]
+            pred = model.predict(encoder.transform([text]))[0]
             rec = recommendations.get(pred, recommendations["default"])
             save_to_db(f.filename, "-", "Report", pred, f"{rec['test']} | {rec['doctor']}")
             result = {"filename": f.filename, "disease": pred, "test": rec["test"], "doctor": rec["doctor"]}
@@ -134,7 +143,7 @@ def report():
 
 @app.route('/history')
 def history():
-    conn = sqlite3.connect('patients.db')
+    conn = sqlite3.connect(DATABASE_PATH)
     c = conn.cursor()
     c.execute("SELECT * FROM patient_history ORDER BY id DESC")
     records = c.fetchall()
